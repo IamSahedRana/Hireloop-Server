@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -29,6 +30,13 @@ const database = connectedClient.db("hireloopdb");
 const users = database.collection("user");
 const jobs = database.collection("jobs");
 const applications = database.collection("applications");
+const payments = database.collection("payments");
+// one payment record per Stripe checkout session
+payments.createIndex({ sessionId: 1 }, { unique: true });
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// free plan includes this many applications in total; paying unlocks unlimited
+const FREE_APPLICATION_LIMIT = 3;
 
 app.get('/', (req, res) => {
     res.send('hire loop is looping')
@@ -113,6 +121,23 @@ app.get('/applications', async (req, res) => {
 
 app.post('/applications', async (req, res) => {
     const application = req.body;
+
+    // free-plan paywall: after FREE_APPLICATION_LIMIT applications the next
+    // apply is rejected until a paid checkout is recorded for this user
+    const applicantId = application.userId;
+    if (applicantId) {
+        const hasPaid = await payments.findOne({ userId: applicantId, status: 'paid' });
+        if (!hasPaid) {
+            const appliedCount = await applications.countDocuments({ userId: applicantId });
+            if (appliedCount >= FREE_APPLICATION_LIMIT) {
+                return res.status(402).send({
+                    error: 'limit_reached',
+                    message: `Free plan includes ${FREE_APPLICATION_LIMIT} applications. Upgrade to Pro to keep applying.`,
+                });
+            }
+        }
+    }
+
     // timestamp server-side so listings can sort by recency
     if (!application.appliedAt) application.appliedAt = new Date();
     const result = await applications.insertOne(application);
@@ -125,6 +150,82 @@ app.post('/applications', async (req, res) => {
         }
     }
     res.send(result);
+})
+
+// payments related apis
+//
+// POST /payments/record — called by the Next.js success page after Stripe
+// redirects back. The client only sends the checkout session id; EVERYTHING
+// else (payer, amount, plan, paid state) is re-verified here against Stripe
+// with the server's own secret key, so a forged or reused session id can
+// never mark an account as paid.
+app.post('/payments/record', async (req, res) => {
+    const { sessionId } = req.body || {};
+    if (!sessionId || typeof sessionId !== 'string') {
+        return res.status(400).send({ error: 'sessionId is required' });
+    }
+
+    let session;
+    try {
+        session = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (err) {
+        // unknown/expired session id → not a real payment
+        return res.status(400).send({ error: 'Unknown checkout session' });
+    }
+
+    if (session.payment_status !== 'paid') {
+        return res.status(400).send({ error: 'Payment not completed' });
+    }
+
+    // credit the payer recorded in the session metadata — never the caller —
+    // so a paid session id belonging to user A can't be used to unlock user B
+    const userId = session.metadata?.userId;
+    if (!userId) {
+        return res.status(400).send({ error: 'Checkout session has no buyer attached' });
+    }
+
+    const payment = {
+        sessionId,
+        userId,
+        plan: session.metadata?.planId || 'pro',
+        amount: session.amount_total,
+        currency: session.currency,
+        status: 'paid',
+        paidAt: new Date(),
+    };
+
+    try {
+        await payments.insertOne(payment);
+    } catch (err) {
+        // duplicate key → this session was already recorded (browser refresh,
+        // double redirect). Return the existing record instead of failing.
+        if (err?.code === 11000) {
+            const existing = await payments.findOne({ sessionId });
+            return res.send({ recorded: true, alreadyRecorded: true, payment: existing });
+        }
+        console.dir(err);
+        return res.status(500).send({ error: 'Could not record payment' });
+    }
+
+    // flip the user's plan flag so dashboards can show Pro immediately
+    const userFilter = /^[a-f\d]{24}$/i.test(userId) ? { _id: new ObjectId(userId) } : { _id: userId };
+    try {
+        await users.updateOne(userFilter, { $set: { plan: 'paid', paidAt: payment.paidAt } });
+    } catch (err) {
+        console.dir(err); // payment is recorded; plan flag is a convenience
+    }
+
+    res.send({ recorded: true, payment });
+})
+
+// GET /payments/status?userId=... — is this account on the paid plan?
+app.get('/payments/status', async (req, res) => {
+    const userId = req.query.userId;
+    if (!userId) {
+        return res.status(400).send({ error: 'userId is required' });
+    }
+    const payment = await payments.findOne({ userId, status: 'paid' }, { sort: { paidAt: -1 } });
+    res.send({ paid: !!payment, payment });
 })
 
 
