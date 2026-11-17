@@ -66,6 +66,10 @@ app.get('/jobs', async (req, res) => {
         if (req.query.category) {
             query.category = { $in: [].concat(req.query.category) };
         }
+        // recruiter scoping: only the jobs this account created
+        if (req.query.createdBy) {
+            query.createdBy = req.query.createdBy;
+        }
         if (req.query.search) {
             query.$or = [
                 { title: { $regex: req.query.search, $options: 'i' } },
@@ -114,8 +118,52 @@ app.get('/applications', async (req, res) => {
         query.userId = req.query.applicantId;
     }
 
+    // recruiter "view applications by job" filter
+    if (req.query.jobId) {
+        query.jobId = req.query.jobId;
+    }
+
+    // recruiter scoping: applications to any job this recruiter created
+    // (join — find their jobs, then match applications by those job ids).
+    // An explicit ?jobId filter wins, so ?ownerId&jobId still narrows to one job.
+    if (req.query.ownerId) {
+        const ownJobs = await jobs.find({ createdBy: req.query.ownerId }).toArray();
+        const ownJobIds = ownJobs.map(job => String(job._id));
+        query.jobId = req.query.jobId
+            ? req.query.jobId // already scoped to one of their jobs
+            : { $in: ownJobIds };
+    }
+
     const cursor = applications.find(query);
     const result = await cursor.toArray();
+    res.send(result);
+})
+
+// recruiter updates an application's status (New → Interviewing → Reviewing → Rejected)
+const APPLICATION_STATUSES = ['New', 'Interviewing', 'Reviewing', 'Rejected'];
+
+app.patch('/applications/:id', async (req, res) => {
+    const { id } = req.params;
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+        return res.status(400).send({ error: 'invalid_id', message: 'Not a valid application id.' });
+    }
+
+    const { status } = req.body || {};
+    if (!APPLICATION_STATUSES.includes(status)) {
+        return res.status(400).send({
+            error: 'invalid_status',
+            message: `Status must be one of: ${APPLICATION_STATUSES.join(', ')}.`,
+        });
+    }
+
+    const result = await applications.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set: { status, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+    );
+    if (!result) {
+        return res.status(404).send({ error: 'not_found', message: 'Application not found.' });
+    }
     res.send(result);
 })
 
